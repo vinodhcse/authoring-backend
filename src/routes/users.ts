@@ -21,6 +21,15 @@ router.post('/', logExecutionTime, async (req, res) => {
 });
 
 // GET user by ID
+router.get('/me', logExecutionTime, async (req, res) => {
+   const jwtUserId = (req as any).user?.userId;
+  const doc = await db.collection('users').doc(jwtUserId).get();
+  if (!doc.exists) return res.status(404).json({ error: 'User not found' });
+  res.json({ id: doc.id, ...doc.data() });
+});
+
+
+// GET user by ID
 router.get('/:userId', logExecutionTime, selfAuthorizeRole(), async (req, res) => {
   const doc = await db.collection('users').doc(req.params.userId).get();
   if (!doc.exists) return res.status(404).json({ error: 'User not found' });
