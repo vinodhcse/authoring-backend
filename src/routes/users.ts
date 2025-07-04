@@ -28,6 +28,26 @@ router.get('/me', logExecutionTime, async (req, res) => {
   res.json({ id: doc.id, ...doc.data() });
 });
 
+// GET user by email
+router.get('/email/:emailId', logExecutionTime, async (req, res) => {
+  try {
+    const { emailId } = req.params;
+    console.log('Fetching user by email:', emailId);
+    const snapshot = await db.collection('users').where('email', '==', emailId).get();
+
+    if (snapshot.empty) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const userDoc = snapshot.docs[0];
+    const user = userDoc.data();
+    res.json({ id: userDoc.id, ...user });
+  } catch (err) {
+    logger.error('Failed to fetch user by email', err);
+    res.status(500).json({ error: 'Failed to fetch user by email' });
+  }
+});
+
 
 // GET user by ID
 router.get('/:userId', logExecutionTime, selfAuthorizeRole(), async (req, res) => {
@@ -35,6 +55,8 @@ router.get('/:userId', logExecutionTime, selfAuthorizeRole(), async (req, res) =
   if (!doc.exists) return res.status(404).json({ error: 'User not found' });
   res.json({ id: doc.id, ...doc.data() });
 });
+
+
 
 // PUT update user
 router.put('/:userId', logExecutionTime, selfAuthorizeRole(), async (req, res) => {

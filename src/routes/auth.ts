@@ -11,7 +11,7 @@ const TOKEN_EXPIRY = '120m'; // Token valid for 7 days
 
 // Signup
 router.post('/signup', async (req, res) => {
-  const { email, password, name,globalRole } = req.body;
+  const { email, password, name, globalRole } = req.body;
   try {
     const snapshot = await db.collection('users').where('email', '==', email).get();
     if (!snapshot.empty) return res.status(400).json({ error: 'Email already exists' });
@@ -40,7 +40,6 @@ router.post('/signup', async (req, res) => {
 router.post('/login', async (req, res) => {
   const { email, password } = req.body;
   try {
-   // console.log('jwt_key' , JWT_SECRET);
     const snapshot = await db.collection('users').where('email', '==', email).limit(1).get();
     if (snapshot.empty) return res.status(401).json({ error: 'Invalid credentials' });
 
@@ -57,17 +56,17 @@ router.post('/login', async (req, res) => {
   }
 });
 
+// Refresh token
 router.post('/refresh-token', async (req, res) => {
   const refreshToken = req.body.refreshToken;
 
-  if (!refreshToken) return res.status(401).json({ error: 'Missing refresh token' });
+  if (!refreshToken) {
+    res.status(401).json({ error: 'Missing refresh token' });
+    return;
+  }
 
   try {
     const decoded = jwt.verify(refreshToken, process.env.REFRESH_SECRET!);
-
-    // Optional: check in DB if refreshToken is valid (if you're storing them)
-    // const snapshot = await db.collection('refreshTokens').where('token', '==', refreshToken).get();
-    // if (snapshot.empty) return res.status(403).json({ error: 'Invalid refresh token' });
 
     const newAccessToken = jwt.sign(
       {
@@ -80,11 +79,26 @@ router.post('/refresh-token', async (req, res) => {
     );
 
     res.json({ accessToken: newAccessToken });
-
   } catch (err) {
     res.status(403).json({ error: 'Invalid refresh token' });
   }
 });
 
+// Logout
+router.post('/logout', async (req, res) => {
+  const token = req.headers.authorization?.split(' ')[1];
+
+  if (!token) {
+    res.status(400).json({ error: 'Missing token' });
+    return;
+  }
+
+  try {
+    jwt.verify(token, JWT_SECRET);
+    res.status(200).json({ message: 'Logged out successfully' });
+  } catch (err) {
+    res.status(403).json({ error: 'Invalid token' });
+  }
+});
 
 export default router;

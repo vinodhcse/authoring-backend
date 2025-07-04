@@ -22,13 +22,14 @@ export const authorizeRole = (requiredRoles: string[]) => {
       return next();
     }
 
-    if (globalRole === 'ADMIN' || globalRole === 'PAID_USER') {
+    //if (globalRole === 'ADMIN' || globalRole === 'PAID_USER') {
+    if (globalRole === 'ADMIN' ) {
       return next();
     }
 
-    const collaborator = book.collaborators?.find((c: any) => c.userId === userId);
+    const collaborator = book.collaborators?.find((c: any) => c.user_id === userId);
 
-    if (!collaborator || !requiredRoles.includes(collaborator.role)) {
+    if (!collaborator || !requiredRoles.includes(collaborator.collaborator_type)) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
     

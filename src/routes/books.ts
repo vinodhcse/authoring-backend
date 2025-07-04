@@ -22,16 +22,20 @@ import ListItem from '@tiptap/extension-list-item';
 import { convertDocxToTiptapChapters } from "../utils/docxToTiptap";
 import cors from "cors";
 import fs from "fs";
+import nodemailer from 'nodemailer';
+import bookPlannerRouter from './bookPlanner';
 
 // Configure multer (in-memory storage)
 const upload = multer({ storage: multer.memoryStorage() });
 
 const router = express.Router();
 
+
+// Fix collaborator filtering logic in the `/userbooks` route
 router.get('/userbooks', logExecutionTime, async (req, res) => {
   const userId = (req as any).user?.userId;
   console.log('Fetching books for user:', userId);
-  if (!userId) {    
+  if (!userId) {
     return res.status(400).json({ error: 'Invalid User' });
   }
   try {
@@ -46,40 +50,35 @@ router.get('/userbooks', logExecutionTime, async (req, res) => {
     }));
 
     console.log('Authored books:', authoredBooks.length, authoredBooks);
-    
-    // 2. Books where user is a collaborator (as CO_WRITER or EDITOR or REVIEWER)
-    const collaboratorSnapshot = await db.collection('books')
-      .where('collaborators', 'array-contains-any', [
-        { user_id: userId, collaborator_type: 'CO_WRITER' },
-        { user_id: userId, collaborator_type: 'EDITOR' },
-        { user_id: userId, collaborator_type: 'REVIEWER' }
-      ])
-      .get();
+
+    // 2. Books where user is a collaborator
+    const allBooksSnapshot = await db.collection('books').where('collaboratorIds', 'array-contains', userId).get();
 
     const editableBooks: any[] = [];
     const reviewableBooks: any[] = [];
 
-    collaboratorSnapshot.docs.forEach(doc => {
+    allBooksSnapshot?.docs?.forEach(doc => {
       const data = doc.data();
       const collab = (data.collaborators || []).find((c: any) => c.user_id === userId);
 
       if (!collab) return;
 
-      if (['CO_WRITER', 'EDITOR'].includes(collab.collaborator_type)) {
+      if (collab.collaborator_type === 'EDITOR') {
         editableBooks.push({ id: doc.id, ...data });
       } else if (collab.collaborator_type === 'REVIEWER') {
         reviewableBooks.push({ id: doc.id, ...data });
+      } else if (collab.collaborator_type === 'CO_WRITER') {
+        authoredBooks.push({ id: doc.id, ...data });
       }
     });
 
     console.log('Editable books:', editableBooks);
-    console.log('Reviewable books:',  reviewableBooks);
+    console.log('Reviewable books:', reviewableBooks);
 
     res.json({ authoredBooks, editableBooks, reviewableBooks });
-
   } catch (err) {
-    logger.error('Error fetching categorized books for user', err);
-    res.status(500).json({ error: 'Failed to fetch categorized books' });
+    logger.error('Failed to fetch user books', err);
+    res.status(500).json({ error: 'Failed to fetch user books' });
   }
 });
 
@@ -108,6 +107,83 @@ router.get('/:bookId', logExecutionTime, authorizeRole(['AUTHOR', 'CO_WRITER', '
   }
 });
 
+
+// POST invite a user to a book
+router.post('/:bookId/invite', logExecutionTime, async (req, res) => {
+  try {
+    const { bookId } = req.params;
+    const { email, role } = req.body;
+
+    if (!email || !role) {
+      return res.status(400).json({ error: 'Email and role are required' });
+    }
+
+    // Fetch book details
+    const bookDoc = await db.collection('books').doc(bookId).get();
+    if (!bookDoc.exists) {
+      return res.status(404).json({ error: 'Book not found' });
+    }
+
+    const bookData = bookDoc.data();
+    const authorName = bookData?.authorName || 'Unknown Author';
+
+    // Generate invitation token
+    const invitationToken = uuidv4();
+
+    // Create or update user record
+    const userSnapshot = await db.collection('users').where('email', '==', email).get();
+    if (userSnapshot.empty) {
+      // Create new user
+      await db.collection('users').add({
+        email,
+        globalRole: 'Unregistered',
+        status: 'invited',
+        invitationToken,
+        invitedBy: authorName,
+        invitedAt: new Date().toISOString(),
+      });
+    } else {
+      // Update existing user
+      const userRef = userSnapshot.docs[0].ref;
+      await userRef.update({
+        status: 'invited',
+        invitationToken,
+        invitedBy: authorName,
+        invitedAt: new Date().toISOString(),
+      });
+    }
+
+    // Send invitation email
+    const transporter = nodemailer.createTransport({
+      service: 'gmail',
+      auth: {
+        user: 'your-email@gmail.com', // Replace with your email
+        pass: 'your-email-password', // Replace with your email password
+      },
+    });
+
+    const mailOptions = {
+      from: 'noreply@authorstudio.com',
+      to: email,
+      subject: `Invitation to collaborate on ${bookData?.title}`,
+      html: `
+        <h1>You're Invited!</h1>
+        <p>${authorName} has invited you to collaborate on the book titled <strong>${bookData?.title}</strong>.</p>
+        <p>Your role: <strong>${role}</strong></p>
+        <p>Click the link below to activate your account and join the collaboration:</p>
+        <a href="https://your-app.com/activate?token=${invitationToken}">Activate Account</a>
+        <p>If you did not expect this invitation, you can safely ignore this email.</p>
+      `,
+    };
+
+    await transporter.sendMail(mailOptions);
+
+    res.status(200).json({ message: 'Invitation sent successfully' });
+  } catch (err) {
+    logger.error('Failed to invite user', err);
+    res.status(500).json({ error: 'Failed to invite user' });
+  }
+});
 
 
 
@@ -405,6 +481,11 @@ router.patch('/:bookId/versions/:versionId/chapters/:chapterId/comments/:comment
   }
 });
 
+
+// Mount bookPlanner routes under /books/:bookId/versions/:versionId
+router.use('/:bookId/versions/:versionId', bookPlannerRouter);
+
+
 // DELETE comment
 router.delete('/:commentId', logExecutionTime,  authorizeRole(['AUTHOR', 'CO_WRITER', 'EDITOR', 'REVIEWER']), async (req, res) => {
   await db.collection('chapters')
@@ -581,6 +662,24 @@ router.post('/:bookId/versions', logExecutionTime, authorizeRole(['AUTHOR', 'CO_
   } catch (err) {
     logger.error('Failed to create version', err);
     res.status(500).send('Failed to create version');
+  }
+});
+
+
+
+// GET all versions under a book
+router.get('/:bookId/versions/:versionId', logExecutionTime,  authorizeRole(['AUTHOR', 'CO_WRITER', 'EDITOR', 'REVIEWER']), async (req, res) => {
+  try {
+    const { bookId, versionId } = req.params;
+    const snapshot = await db.collection('books').doc(bookId).collection('versions').doc(versionId).get();
+    if (!snapshot.exists) {
+      return res.status(404).send('Version not found');
+    }
+    const versionDoc = snapshot.exists ? { id: snapshot.id, ...snapshot.data() } : null;
+    res.json(versionDoc);
+  } catch (err) {
+    logger.error('Failed to fetch versions', err);
+    res.status(500).send('Failed to fetch versions');
   }
 });
 
@@ -798,6 +897,7 @@ const updateJobInDB = async (jobId: string, completedChapters: number, status: s
     updatedAt: new Date().toISOString(),
   });
 };
+
 
 
 
