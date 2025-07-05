@@ -648,7 +648,9 @@ router.get('/:bookId/versions', logExecutionTime,  authorizeRole(['AUTHOR', 'CO_
 router.post('/:bookId/versions', logExecutionTime, authorizeRole(['AUTHOR', 'CO_WRITER']), async (req, res) => {
   try {
     const { bookId } = req.params;
-    const { name, metaData } = req.body;
+    const { name, metaData, baseVersionId } = req.body;
+
+    // Create a new version
     const versionRef = await db
       .collection('books')
       .doc(bookId)
@@ -656,9 +658,51 @@ router.post('/:bookId/versions', logExecutionTime, authorizeRole(['AUTHOR', 'CO_
       .add({
         name,
         createdAt: new Date().toISOString(),
-        metaData: metaData || {}
+        metaData: metaData || {},
       });
-    res.status(201).json({ id: versionRef.id });
+
+    const newVersionId = versionRef.id;
+
+    // If `existingVersion` is provided, clone its data
+    if (baseVersionId) {
+      const existingVersionRef = db.collection('books').doc(bookId).collection('versions').doc(baseVersionId);
+
+      // Fetch existing version data
+      const existingVersionDoc = await existingVersionRef.get();
+      if (!existingVersionDoc.exists) {
+        return res.status(404).json({ error: 'Existing version not found' });
+      }
+
+      const existingVersionData = existingVersionDoc.data();
+
+      // Clone plotCanvas
+      if (existingVersionData?.plotCanvas) {
+        await db
+          .collection('books')
+          .doc(bookId)
+          .collection('versions')
+          .doc(newVersionId)
+          .update({ plotCanvas: existingVersionData.plotCanvas });
+      }
+
+      // Clone chapters
+      const chaptersSnapshot = await existingVersionRef.collection('chapters').get();
+      const batch = db.batch();
+      chaptersSnapshot.docs.forEach((chapterDoc) => {
+        const chapterData = chapterDoc.data();
+        const newChapterRef = db
+          .collection('books')
+          .doc(bookId)
+          .collection('versions')
+          .doc(newVersionId)
+          .collection('chapters')
+          .doc();
+        batch.set(newChapterRef, chapterData);
+      });
+      await batch.commit();
+    }
+
+    res.status(201).json({ id: newVersionId });
   } catch (err) {
     logger.error('Failed to create version', err);
     res.status(500).send('Failed to create version');

@@ -82,6 +82,33 @@ router.put('/:userId', logExecutionTime, selfAuthorizeRole(), async (req, res) =
   res.json({ id: updated.id, ...updated.data() });
 });
 
+
+// PUT update user
+router.patch('/:userId', logExecutionTime, selfAuthorizeRole(), async (req, res) => {
+  // Validate that the user is not trying to update their own role
+  if ((req.params.userId === (req as any).user?.userId) && req.body.globalRole) {
+    return res.status(403).json({ error: 'You cannot change your own role' });
+  }
+  // Update user data
+  if (req.body.role && !authorizeRole(req.body.role)) {
+    return res.status(400).json({ error: 'Invalid role specified' });  
+  }
+   const userData = { ...req.body };
+
+    // Hash password if provided
+    if (userData.password) {
+      const hashedPassword = await bcrypt.hash(userData.password, 10);
+      userData.password = hashedPassword;
+    }
+  
+    console.log('Updating user data:', userData);
+  await db.collection('users').doc(req.params.userId).update(userData);
+  const updated = await db.collection('users').doc(req.params.userId).get();
+  res.json({ id: updated.id, ...updated.data() });
+});
+
+
+
 // DELETE user + cascade delete billing/subscription
 router.delete('/:userId', logExecutionTime, selfAuthorizeRole(), async (req, res) => {
   const userRef = db.collection('users').doc(req.params.userId);
