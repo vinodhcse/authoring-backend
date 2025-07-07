@@ -15,6 +15,7 @@ import authRouter from './routes/auth';
 import { authenticateJWT } from './middleware/authenticateJWT';
 import filesRouter from './routes/files';
 import jobsRouter from './routes/job';
+import aifeatures from './routes/aifeatures';
 
 
 dotenv.config();
@@ -59,6 +60,7 @@ app.use('/api/billing', authenticateJWT, billingRouter);
 app.use('/api/files', authenticateJWT, filesRouter);
 app.use('/api/jobs', authenticateJWT, jobsRouter);
 app.use('/api/auth', authRouter);
+app.use('/api/ai', authenticateJWT, aifeatures);
 // Root
 app.get('/', (_, res) => {
   res.json({ message: 'Authoring API backend is running.' });

@@ -5,6 +5,81 @@ import { authorizeRole, selfAuthorizeRole } from '../middleware/authorizeRole';
 import bcrypt from 'bcrypt';
 const router = Router();
 
+const defaultSettings =   {
+    aiSettings: {
+      aiEnabled: true,
+      features: [
+        {
+          id: "rephrasing",
+          enabled: true,
+          label: "Rephrasing",
+          prompt: "Rephrase the following text to be more concise and engaging.",
+          llmModel: "default",
+        },
+        {
+          id: "expanding",
+          enabled: true,
+          label: "Expanding",
+          prompt: "Expand the following text with more details, inner monologue, and sensory imagery.",
+          llmModel: "default",
+        },
+        {
+          id: "concising",
+          enabled: true,
+          label: "Concising",
+          prompt: "Shorten the following text with more details, inner monologue, and sensory imagery.",
+          llmModel: "default",
+        },
+        {
+          id: "generating",
+          enabled: true,
+          label: "Generating new lines",
+          prompt: "Generate new lines based on the context provided.",
+          llmModel: "default",
+        },
+        {
+          id: "validation",
+          enabled: true,
+          label: "Validation",
+          prompt: "Validate the following text for grammar, style, and coherence.",
+          llmModel: "default",
+        },
+        {
+          id: "planning",
+          enabled: true,
+          label: "Auto-updating Planning Boards",
+          prompt: "Update the planning board with the latest context and details.",
+          llmModel: "default",
+        },
+        {
+          id: "suggestions",
+          enabled: true,
+          label: "Auto-suggest Next Lines",
+          prompt: "Suggest the next lines based on the current context.",
+          llmModel: "default",
+        },
+      ],
+    },
+    theme: {
+      color: "blue",
+      customColorHex: "#0000FF",
+    },
+    collaboration: {
+      copyAllowed: true,
+      allowComments: true,
+      allowSuggestions: true,
+      allowTrackChanges: false,
+    },
+    advanced: {
+      temperature: 0.7,
+      maxTokens: 1000,
+      validationLevel: "balanced",
+      tonePreset: "conversational",
+      maxSentenceLength: "medium",
+      vocabularyComplexity: "medium",
+    },
+  };
+
 // GET all users
 router.get('/', logExecutionTime, selfAuthorizeRole(), async (_, res) => {
   const snapshot = await db.collection('users').get();
@@ -12,10 +87,31 @@ router.get('/', logExecutionTime, selfAuthorizeRole(), async (_, res) => {
   res.json(users);
 });
 
-// POST create user
+// POST create user`
 router.post('/', logExecutionTime, async (req, res) => {
   const userData = req.body;
-  const ref = await db.collection('users').add(userData);
+  // validate user data
+  if (!userData.email || !userData.password || !userData.name) {
+    return res.status(400).json({ error: 'Email, password and name are required fields' });
+  }
+  // Check if email already exists
+  const existingUserSnapshot = await db.collection('users').where('email', '==', userData.email).get();
+  if (!existingUserSnapshot.empty) {
+    return res.status(400).json({ error: 'Email already exists' });
+  } 
+  // Hash password
+  const hashedPassword = await bcrypt.hash(userData.password, 10);
+  userData.password = hashedPassword;
+  // Set default role if not provided
+  if (!userData.globalRole) {
+    userData.globalRole = 'FREE_USER'; // Default to FREE_USER
+  } 
+  userData.createdAt = new Date().toISOString();
+  userData.updatedAt = new Date().toISOString();
+  userData.lastLogin = new Date().toISOString();
+  userData.settings = defaultSettings; // Assuming dafaultSettings is defined somewhere in your code
+  console.log('Creating user with data:', userData);
+  const ref = await db.collection('users').add(userData); 
   const doc = await ref.get();
   res.status(201).json({ id: doc.id, ...doc.data() });
 });
@@ -99,6 +195,7 @@ router.patch('/:userId', logExecutionTime, selfAuthorizeRole(), async (req, res)
     if (userData.password) {
       const hashedPassword = await bcrypt.hash(userData.password, 10);
       userData.password = hashedPassword;
+      console.log('Hashing password for user update');
     }
   
     console.log('Updating user data:', userData);

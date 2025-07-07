@@ -8,28 +8,117 @@ dotenv.config();
 const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || 'authoring_app';
 const TOKEN_EXPIRY = '120m'; // Token valid for 7 days
+const defaultSettings =   {
+    aiSettings: {
+      aiEnabled: true,
+      features: [
+        {
+          id: "rephrasing",
+          enabled: true,
+          label: "Rephrasing",
+          prompt: "Rephrase the following text to be more concise and engaging.",
+          llmModel: "default",
+        },
+        {
+          id: "expanding",
+          enabled: true,
+          label: "Expanding",
+          prompt: "Expand the following text with more details, inner monologue, and sensory imagery.",
+          llmModel: "default",
+        },
+        {
+          id: "concising",
+          enabled: true,
+          label: "Concising",
+          prompt: "Shorten the following text with more details, inner monologue, and sensory imagery.",
+          llmModel: "default",
+        },
+        {
+          id: "generating",
+          enabled: true,
+          label: "Generating new lines",
+          prompt: "Generate new lines based on the context provided.",
+          llmModel: "default",
+        },
+        {
+          id: "validation",
+          enabled: true,
+          label: "Validation",
+          prompt: "Validate the following text for grammar, style, and coherence.",
+          llmModel: "default",
+        },
+        {
+          id: "planning",
+          enabled: true,
+          label: "Auto-updating Planning Boards",
+          prompt: "Update the planning board with the latest context and details.",
+          llmModel: "default",
+        },
+        {
+          id: "suggestions",
+          enabled: true,
+          label: "Auto-suggest Next Lines",
+          prompt: "Suggest the next lines based on the current context.",
+          llmModel: "default",
+        },
+      ],
+    },
+    theme: {
+      color: "blue",
+      customColorHex: "#0000FF",
+    },
+    collaboration: {
+      copyAllowed: true,
+      allowComments: true,
+      allowSuggestions: true,
+      allowTrackChanges: false,
+    },
+    advanced: {
+      temperature: 0.7,
+      maxTokens: 1000,
+      validationLevel: "balanced",
+      tonePreset: "conversational",
+      maxSentenceLength: "medium",
+      vocabularyComplexity: "medium",
+    },
+  };
+
 
 // Signup
 router.post('/signup', async (req, res) => {
-  const { email, password, name, globalRole } = req.body;
+  //const { email, password, name, globalRole } = req.body;
+   const userData = req.body;
   try {
-    const snapshot = await db.collection('users').where('email', '==', email).get();
-    if (!snapshot.empty) return res.status(400).json({ error: 'Email already exists' });
+    
+    // validate user data
+      if (!userData.email || !userData.password || !userData.name) {
+        return res.status(400).json({ error: 'Email, password and name are required fields' });
+      }
+      // Check if email already exists
+      const existingUserSnapshot = await db.collection('users').where('email', '==', userData.email).get();
+      if (!existingUserSnapshot.empty) {
+        return res.status(400).json({ error: 'Email already exists' });
+      } 
+      // Hash password
+    
+      userData.createdAt = new Date().toISOString();
+      userData.updatedAt = new Date().toISOString();
+      userData.lastLogin = new Date().toISOString();
+      userData.settings = defaultSettings; // Assuming dafaultSettings is defined somewhere in your code
+      console.log('Creating user with data:', userData);
 
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const role = globalRole || "FREE_USER"; // Default to FREE_USER if not provided
-    if (!['FREE_USER', 'ADMIN', 'PAID_USER'].includes(role)) {
+    const hashedPassword = await bcrypt.hash(userData.password, 10);
+    userData.password = hashedPassword;
+    userData.globalRole = userData.globalRole || "FREE_USER"; // Default to FREE_USER if not provided
+    
+    if (!['FREE_USER', 'ADMIN', 'PAID_USER'].includes(userData.globalRole)) {
       return res.status(400).json({ error: 'Invalid role specified' });
     }
-    const userRef = await db.collection('users').add({
-      email,
-      password: hashedPassword,
-      name,
-      globalRole: role,
-      createdAt: new Date().toISOString(),
-    });
 
-    const token = jwt.sign({ userId: userRef.id, email }, JWT_SECRET, { expiresIn: TOKEN_EXPIRY });
+    console.log('Creating user with data:', userData);
+    const userRef = await db.collection('users').add(userData);
+
+    const token = jwt.sign({ userId: userRef.id, email: userData.email }, JWT_SECRET, { expiresIn: TOKEN_EXPIRY });
     res.status(201).json({ token, userId: userRef.id });
   } catch (err) {
     res.status(500).json({ error: 'Signup failed' });
