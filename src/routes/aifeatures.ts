@@ -14,9 +14,11 @@ interface PromptContext {
 //const OLLAMA_REPHRASING_MODEL = "qwen3:8b";
 //const OLLAMA_MAPPING_MODEL = "qwen3:8b";
 
-const OLLAMA_REPHRASING_MODEL = "wizardlm2:7b";
-const OLLAMA_MAPPING_MODEL = "wizardlm2:7b";
+//const OLLAMA_REPHRASING_MODEL = "wizardlm2:7b";
+//const OLLAMA_MAPPING_MODEL = "wizardlm2:7b";
 
+const OLLAMA_REPHRASING_MODEL = "gemma3:4b";
+const OLLAMA_MAPPING_MODEL = "gemma3:4b";
 
 router.post('/rephraser1', async (req: Request, res: Response, next: NextFunction) => {
   try {

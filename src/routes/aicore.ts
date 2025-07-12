@@ -1,7 +1,7 @@
 import fetch from 'node-fetch';
 
 const OLLAMA_API_URL = "http://localhost:11434/api/generate";
-const OLLAMA_MAPPING_MODEL = "wizardlm2:7b";
+const OLLAMA_MAPPING_MODEL = "gemma3:4b";
 
 export async function callOllama(systemPrompt: string, userPrompt: string, format: 'json' | 'text' = 'text', model: string): Promise<any> {
   const payload: { [key: string]: any } = {
