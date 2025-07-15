@@ -4,14 +4,17 @@ import { getStorage } from 'firebase-admin/storage';
 import dotenv from 'dotenv';
 
 dotenv.config(); // Make sure this is at the top
-console.log('BUCKET:', process.env.FIREBASE_STORAGE_BUCKET);
+//console.log('BUCKET:', process.env.FIREBASE_STORAGE_BUCKET);
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount as admin.ServiceAccount),
   storageBucket: process.env.FIREBASE_STORAGE_BUCKET, // Must be set in .env
 });
 
+
 const db = admin.firestore();
 const bucket = getStorage().bucket();
+//console.log('Firebase initialized with bucket:', bucket.name);
+//console.log('Firestore initialized with database:', db);
 export { db, admin, bucket };
 
 

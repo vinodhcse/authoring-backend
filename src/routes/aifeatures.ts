@@ -1,44 +1,130 @@
 import express, { Request, Response, NextFunction } from 'express';
 import compression from 'compression';
-import { callOllama, callOllamaStream, splitIntoParagraphs, mapRephrasedToOriginalLLM } from './aicore';
+import { callOllama, callOllamaStream, splitIntoParagraphs, mapRephrasedToOriginalLLM } from './aicore'; // Assuming these are in aicore.ts
+import Together from 'together-ai';
+import dotenv from 'dotenv';
+import { get_encoding } from '@dqbd/tiktoken';
+import JSONStreamParser from 'json-stream-parser'; // Make sure you have this installed: npm install json-stream-parser
+import { P } from 'pino';
+import { UserImportBuilder } from 'firebase-admin/lib/auth/user-import-builder';
 
 const router = express.Router();
 router.use(compression()); // Enable response compression and flushing
 
-interface PromptContext {
-  contextType: string;
-  id: string;
-  prompt: string;
+dotenv.config();
+
+console.log("Using Together API Key:", process.env.TOGETHER_API_KEY ? "Loaded" : "Not Loaded");
+const together = new Together({ apiKey: process.env.TOGETHER_API_KEY });
+
+// Define your models with a primary and fallbacks
+const MODELS = [
+    {
+        name: "Qwen/Qwen3-235B-A22B-fp8-tput1", // Primary JSON-output model
+        temperature: 0.66,
+        type: "json"
+    },
+    {
+        name: "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8_1", // Fallback JSON-output model
+        temperature: 0.66,
+        type: "json"
+    },
+    {
+        name: "Qwen/Qwen1.5-72B-Chat", // Fallback text-only model
+        temperature: 0.66,
+        type: "text"
+    },
+    {
+        name: "google/gemma-3n-E4B-it", // Fallback text-only model
+        temperature: 0.66,
+        type: "text"
+    },
+    
+];
+
+// Helper function to update user credits (replace with your actual database/service call)
+async function updateUserCredits(userId: string, inputTokens: number, outputTokens: number, totalTokens: number) {
+    console.log(`Updating credits for user ${userId}: Input Tokens = ${inputTokens}, Output Tokens = ${outputTokens}, totalTokens = ${totalTokens}`);
+    return true; // Simulate success
 }
 
-//const OLLAMA_REPHRASING_MODEL = "qwen3:8b";
-//const OLLAMA_MAPPING_MODEL = "qwen3:8b";
+// Helper to count words
+function countWords(text: string | null | undefined): number {
+    if (!text) return 0;
+    return text.split(/\s+/).filter(word => word.length > 0).length;
+}
 
-//const OLLAMA_REPHRASING_MODEL = "wizardlm2:7b";
-//const OLLAMA_MAPPING_MODEL = "wizardlm2:7b";
+// Helper to calculate tokens
+function countTokens(text: string | null | undefined): number {
+    if (!text) return 0;
+    try {
+        const encoding = get_encoding("cl100k_base"); // Common encoding for many models
+        const tokens = encoding.encode(text);
+        if (tokens.length === 0) {
+            console.warn(`Warning: No tokens generated for text "${text.substring(0, 50)}..."`);
+            return countWords(text) * 0.75; // Fallback to word count estimation
+        }
+        return tokens.length;
+    } catch (error) {
+        console.warn(`Could not determine exact token count for "${text.substring(0, 50)}...". Estimating by word count.`, error);
+        return Math.ceil(countWords(text) * 0.75); // Rough estimation if encoding fails
+    }
+}
 
-const OLLAMA_REPHRASING_MODEL = "gemma3:4b";
-const OLLAMA_MAPPING_MODEL = "gemma3:4b";
+// Backend: formatStreamPart function - Sends discrete JSON objects followed by a newline
+function formatStreamPart(data: { type: string; [key: string]: any } | { done: boolean }): string {
+    return `${JSON.stringify(data)}\n`;
+}
 
-router.post('/rephraser1', async (req: Request, res: Response, next: NextFunction) => {
-  try {
+interface PromptContext {
+    contextType: string;
+    id: string;
+    prompt: string;
+}
+
+// Define the structure of a rephrased paragraph object that the model should return
+interface RephrasedParagraph {
+    rephrasedParagraphIndex: number;
+    rephrasedParagraphContent: string;
+    originalParagraphContents: string[];
+}
+
+router.post('/rephrase', async (req: Request, res: Response) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders(); 
+
     const {
-      textToRephrase,
-      textBefore,
-      textAfter,
-      customInstructions,
-      promptContexts,
+        textToRephrase,
+        textBefore,
+        textAfter,
+        customInstructions,
+        promptContexts,
+    }: {
+        textToRephrase: string[];
+        textBefore?: string;
+        textAfter?: string;
+        customInstructions?: string;
+        promptContexts?: PromptContext[];
     } = req.body;
 
     if (!textToRephrase || !Array.isArray(textToRephrase) || textToRephrase.length === 0) {
-      return res.status(400).json({ error: 'Invalid or missing textToRephrase' });
+        res.write(formatStreamPart({ type: 'error', message: 'Invalid or missing textToRephrase' }));
+        return res.status(400).end(); 
     }
 
     const fullTextToRephrase = textToRephrase.join('\n\n');
+    
 
-    const rephraseSystemPrompt = `You are a master storyteller and a world-class literary editor. Your task is to elevate a piece of writing by rephrasing it.
+    const userId = 'your_user_id'; 
 
-Analyze the user's text paragraph by paragraph, and sentence by sentence.
+    const userPrompt = `<originalText>${fullTextToRephrase || 'None'}</originalText>`;
+    let retryUserPrompt = userPrompt;
+    const systemPromptJson = `You are a master storyteller and a world-class literary editor. Your task is to elevate a piece of writing by rephrasing it. Only answer in JSON.
+
+Analyze the user's text paragraph by paragraph, and sentence by sentence. Only use the text enclosed within <originalText> and </originalText> for rephrasing.
+Rephrase each input Paragraph at a time. Don't combine Multipel paragraphs into one rephrased paragraph.
+Utilize text within textBefore and textAfter tags as only reference.
 Your rephrasing should:
 1.  **Enrich the Language**: Use more evocative vocabulary and sophisticated sentence structures.
 2.  **Enhance the Prose**: Improve the rhythm, flow, and clarity of the writing.
@@ -48,83 +134,11 @@ Your rephrasing should:
 6.  **Maintain Original Meaning**: Ensure that the rephrased text conveys the same meaning and intent as the original.
 7.  **Use of Context**: If provided, use the context from <textBefore> and <textAfter> to inform your rephrasing.
 8.  **DO not return the same line**: Do not return the same line as in the original text. Always rephrase every paragraph that enriches its vocabulary and standard.
+`;
 
-Additional Instructions:
-${customInstructions || 'None'}
-
-Context:
-<textBefore>
-${textBefore || 'None'}
-</textBefore>
-<textAfter>
-${textAfter || 'None'}
-</textAfter>
-
-Other Context:
-${promptContexts?.map((ctx: PromptContext) => `Type: ${ctx.contextType}, ID: ${ctx.id}, Prompt: ${ctx.prompt}`).join('\n') || 'None'}
-
-Return ONLY the final rephrased paragraphs separated by double line breaks, with no explanations.`;
-
-    const rephraseResponse = await callOllama(rephraseSystemPrompt, fullTextToRephrase, 'text', OLLAMA_REPHRASING_MODEL);
-    let rephrasedText = rephraseResponse.response;
-
-    if (!rephrasedText || typeof rephrasedText !== 'string' || rephrasedText.trim() === '') {
-      return res.status(500).json({ error: 'Failed to rephrase text' });
-    }
-
-    // 🔥 REMOVE any <think>...</think> block if present
-    rephrasedText = rephrasedText.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-    console.log("-----------------------------------------------------------------------------------");
-    console.log('Cleaned rephrased text:', rephrasedText);
-    console.log("-----------------------------------------------------------------------------------");
-
-    //const rephrasedParagraphs = splitIntoParagraphs(rephrasedText);
-
-    const mappings = await mapRephrasedToOriginalLLM(textToRephrase, rephrasedText, OLLAMA_MAPPING_MODEL);
-    console.log('Mappings from rephrased to original:', mappings);
-    
-    res.status(200).json(mappings);
-  } catch (err) {
-    console.error('Error during rephrasing process:', err);
-    next(err);
-  }
-});
-
-
-router.post('/rephrase', async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const {
-      textToRephrase,
-      textBefore,
-      textAfter,
-      customInstructions,
-      promptContexts,
-    } = req.body;
-
-    if (!textToRephrase || !Array.isArray(textToRephrase) || textToRephrase.length === 0) {
-      return res.status(400).json({ error: 'Invalid or missing textToRephrase' });
-    }
-
-    const fullTextToRephrase = textToRephrase.join('\n\n');
-
-    const rephraseSystemPrompt = `You are a master storyteller and a world-class literary editor. Your task is to elevate a piece of writing by rephrasing it.
-
-Analyze the user's text paragraph by paragraph, and sentence by sentence.
-Your rephrasing should:
-1.  **Enrich the Language**: Use more evocative vocabulary and sophisticated sentence structures.
-2.  **Enhance the Prose**: Improve the rhythm, flow, and clarity of the writing.
-3.  **Deepen the Tone**: Subtly weave a more melancholic and somber tone throughout the narrative.
-4.  **Preserve the Core**: Maintain the original plot, character intentions, and key details. Do not add new plot points or characters.
-5.  **Rephase paragraph by baragraph**: Always rephrase paragraph by paragraph, do not rephrase the entire text at once.
-6.  **Paragraph Structure**: Each paragraph in the rephrased text should correspond to a single paragraph in the original text, preserving the original structure.
-7.  **Maintain Original Meaning**: Ensure that the rephrased text conveys the same meaning and intent as the original.
-8.  **Use of Context**: If provided, use the context from <textBefore> and <textAfter> to inform your rephrasing.
-9.  **Do not Skip lines**: Do not skip lines in the original text.
-9.  **Avoid Over-Complexity**: While enriching the text, do not make it overly complex or difficult to read.
-
-
-Additional Instructions:
-${customInstructions || 'None'}
+    const systemPromptText = `You are a master storyteller and a world-class literary editor. Your task is to elevate a piece of writing by rephrasing it. Only use the text enclosed within <originalText> and </originalText> for rephrasing. Preserve the core meaning, enrich the language, enhance the prose, and deepen the tone to be more melancholic and somber. Provide the rephrased text directly, without any additional formatting like JSON.
+    Additional Instructions:
+${customInstructions || 'Make the tone more engaging and vivid.'}
 
 Context:
 <textBefore>
@@ -134,165 +148,334 @@ ${textBefore || 'None'}
 ${textAfter || 'None'}
 </textAfter>
 
-Other Context:
-${promptContexts?.map((ctx: PromptContext) => `Type: ${ctx.contextType}, ID: ${ctx.id}, Prompt: ${ctx.prompt}`).join('\n') || 'None'}
+${promptContexts ? 'Other Context\n' + promptContexts.map((ctx: PromptContext) => `Type: ${ctx.contextType}, ID: ${ctx.id}, Prompt: ${ctx.prompt}`).join('\n') : 'Other Context\nNone'}
+`;
 
-Return ONLY the final rephrased paragraphs separated by double line breaks, with no explanations.`;
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
+    let finalOutputSuccess = false; 
+    let requireRetryWithFallbackModels = false;
+    const initialSystemPromptTokens = countTokens(systemPromptJson);
+    const initialUserPromptTokens = countTokens(userPrompt);
+    totalInputTokens = initialSystemPromptTokens + initialUserPromptTokens;
 
-    const rephraseResponse = await callOllama(rephraseSystemPrompt, fullTextToRephrase, 'text', OLLAMA_REPHRASING_MODEL);
-    let rephrasedText = rephraseResponse.response;
+    const inputWordsLength = countWords(fullTextToRephrase);
+    let max_tokens = Math.ceil((initialUserPromptTokens * 3) + (totalInputTokens * 1.4)+ (initialUserPromptTokens * 1.4));
+    console.log(`Calculated max_tokens: ${max_tokens}`);
+    console.log(`Initial System Prompt Tokens: ${initialSystemPromptTokens}, User Prompt Tokens: ${initialUserPromptTokens}, Total Input Tokens: ${totalInputTokens}`);
 
-    if (!rephrasedText || typeof rephrasedText !== 'string' || rephrasedText.trim() === '') {
-      return res.status(500).json({ error: 'Failed to rephrase text' });
-    }
-
-    // 🔥 REMOVE any <think>...</think> block if present
-    rephrasedText = rephrasedText.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-    console.log("-----------------------------------------------------------------------------------");
-    console.log('Cleaned rephrased text:', rephrasedText);
-    console.log("-----------------------------------------------------------------------------------");
-
-    res.status(200).json({ rephrasedText: rephrasedText });
-  } catch (err) {
-    console.error('Error during rephrasing process:', err);
-    next(err);
-  }
-});
-
-
-router.post('/diffChecker', async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const { originalText, newText } = req.body;
-
-    if (!originalText || !newText) {
-      return res.status(400).json({ error: 'Missing originalText or newText' });
-    }
-
-    const diffSystemPrompt = `You are an expert text analysis AI. Your task is to compare two texts paragraph by paragraph and identify differences.
-
-    I will provide you with 'OriginalText' and 'NewText' within <originalText></originalText> and <newText></newText>.
-
-    For each paragraph in 'NewText', compare it to the corresponding paragraph in 'OriginalText' and identify:
-    - Additions
-    - Deletions
-    - Modifications
-
-    Your output should be a JSON object for each paragraph streamed one at a time. Each object should have:
-    {
-      "newParagraph": "The paragraph from NewText",
-      "originalParagraph": "The corresponding paragraph from OriginalText",
-      "diff": "A description of the differences",
-      "done": false
-    }
-
-    IMPORTANT: Do not include any reasoning, explanations, or summaries in your response. Return only the required JSON objects in the exact format specified above. Do not add any extra text or commentary.`;
-
-    const diffUserPrompt = `
-    <originalText>
-    ${originalText}
-    </originalText>
-
-    <newText>
-    ${newText}
-    </newText>
-    
-    **Output Instructions**:
-    Your output should be a JSON object for each paragraph streamed one at a time. Each object should have:
-    {
-      "newParagraph": "The paragraph from NewText",
-      "originalParagraph": "The corresponding paragraph from OriginalText",
-      "diff": "A description of the differences",
-      "done": false
-    }
-
-    IMPORTANT: Do not include any reasoning, explanations, or summaries in your response. Return only the required JSON objects in the exact format specified above. Do not add any extra text or commentary.
-    `;
-
-    const llmStream = await callOllamaStream(diffSystemPrompt, diffUserPrompt, OLLAMA_MAPPING_MODEL);
-
-    let accumulatedResponse = '';
-    let thinkingCompleted = false;
-
-    res.setHeader('Content-Type', 'application/json');
-
-    llmStream.on('data', (chunk: Buffer) => {
-      const rawData = chunk.toString();
-
-      try {
-        const parsedData = JSON.parse(rawData); // Parse rawData as JSON
-
-        if (parsedData.response) {
-          accumulatedResponse += parsedData.response; // Add parsed response to accumulatedResponse
-        }
-      } catch (err) {
-        console.error('Error parsing rawData:', err);
-      }
-
-      // Check and remove <think> blocks
-      if (accumulatedResponse.includes('</think>')) {
-        accumulatedResponse = accumulatedResponse.replace(/<think>[\s\S]*?<\/think>/g, '');
-        thinkingCompleted = true; // Mark that <think> blocks are removed
-      }
-
-      // Only attempt to parse JSON if <think> blocks are removed
-      if (thinkingCompleted) {
-        console.log('Thinking Completed  Accumulated Response:', accumulatedResponse);
-        try {
-          let startIndex = accumulatedResponse.indexOf('{');
-          let endIndex = accumulatedResponse.lastIndexOf('}');
-
-          while (startIndex !== -1 && endIndex > startIndex) {
-            const potentialJson = accumulatedResponse.slice(startIndex, endIndex + 1);
-
-            try {
-              const parsedData = JSON.parse(potentialJson);
-
-              if (parsedData.newParagraph && parsedData.originalParagraph) {
-                console.log('Complete Parsed JSON:', parsedData);
-                res.write(JSON.stringify({
-                  newParagraph: parsedData.newParagraph,
-                  originalParagraph: parsedData.originalParagraph,
-                  diff: parsedData.diff,
-                  done: false,
-                }) + '\n'); // Send JSON immediately
-
-                if (res.flush) {
-                  res.flush(); // Explicitly flush the response buffer
+    const jsonResponseSchema = {
+        type: "json_schema",
+        schema: {
+            type: "object",
+            properties: {
+                rephrasedParagraphs: {
+                    type: "array",
+                    title: "Rephrased paragraphs",
+                    description: "A list of rephrased paragraphs",
+                    items: {
+                        type: "object",
+                        properties: {
+                            rephrasedParagraphIndex: {
+                                type: "integer",
+                                description: "The sequential index of the rephrased paragraph (e.g., 1 for the first rephrased paragraph, 2 for the second, and so on)."
+                            },
+                            rephrasedParagraphContent: {
+                                type: "string",
+                                description: "The rephrased content of the paragraph. This content should be an elevated, enhanced, and melancholic version of the original text, while preserving its core meaning."
+                            },
+                            originalParagraphContents: {
+                                type: "array",
+                                description: "A list of strings, where each string is the exact content of an original paragraph that was used to form this rephrased paragraph. Only include paragraphs from the original text. If no clear mapping is found for this rephrased paragraph, this array should be empty.",
+                                items: {
+                                    type: "string"
+                                }
+                            }
+                        },
+                        required: [
+                            "rephrasedParagraphIndex",
+                            "rephrasedParagraphContent",
+                            "originalParagraphContents"
+                        ],
+                        additionalProperties: false
+                    }
                 }
-              }
-
-              // Remove processed JSON from accumulated response
-              accumulatedResponse = accumulatedResponse.slice(endIndex + 1);
-              startIndex = accumulatedResponse.indexOf('{');
-              endIndex = accumulatedResponse.lastIndexOf('}');
-            } catch (jsonError) {
-              // If JSON parsing fails, continue accumulating
-              break;
-            }
-          }
-        } catch (err) {
-          console.error('Error parsing accumulated response:', err);
+            },
+            required: [
+                "rephrasedParagraphs"
+            ],
+            additionalProperties: false
         }
-      }
-    });
+    };
 
-    llmStream.on('end', () => {
-      console.log('Stream ended. Sending final done object.');
-      res.write(JSON.stringify({ done: true }) + '\n');
-      if (res.flush) {
-        res.flush(); // Explicitly flush the response buffer
-      }
-      res.end();
-    });
+    for (let i = 0; i < MODELS.length; i++) {
+        const currentModelConfig = MODELS[i];
+        const currentModelName = currentModelConfig.name;
+        const currentModelType = currentModelConfig.type;
+        const currentModelTemperature = currentModelConfig.temperature || 0.66; // Default temperature if not specified
+        let originalParagraphResponse = []
+        if (i >0 && requireRetryWithFallbackModels) return;
 
-    llmStream.on('error', (err: Error) => {
-      console.error('Error streaming from LLM:', err);
-      res.status(500).json({ error: 'Error streaming from LLM', details: err.message });
-    });
-  } catch (err) {
-    console.error('Error during diff checking process:', err);
-    next(err);
-  }
+        console.log(`Attempting to use model: ${currentModelName} (Type: ${currentModelType})`);
+       // res.write(formatStreamPart({ type: 'info', message: `Using model: ${currentModelName}` }));
+        //res.flush();
+        let modelResposneStatus = '';
+        let modalFailureReason = '';
+        let attempt = 1;
+        try {
+            console.log(`Starting attempt ${attempt} for model: ${currentModelName}`);
+            console.log('modelResposneStatus:', modelResposneStatus, 'modalFailureReason:', modalFailureReason, 'attempt:', attempt);
+            while( attempt === 1 || (modelResposneStatus === 'Failed' && modalFailureReason === 'TOKENS_LIMIT' && attempt < 4)) {
+                console.log(`Attempt ${attempt} for model: ${currentModelName}`);
+                let updatedUserPrompt = userPrompt;
+                if ( retryUserPrompt ) {
+                    updatedUserPrompt = retryUserPrompt;
+                        
+                        const updatedUserPromptTokens = countTokens(userPrompt);
+                        max_tokens = Math.ceil((updatedUserPromptTokens * 2) + (totalInputTokens * 1.4)+ (updatedUserPromptTokens * 1.4));
+                        const updatedTotalInputTokens = initialSystemPromptTokens + updatedUserPromptTokens;
+                        console.log(`Updated max_tokens: ${max_tokens}`);
+                        console.log(`Updated System Prompt Tokens: ${initialSystemPromptTokens}, User Prompt Tokens: ${updatedUserPromptTokens}, Total Input Tokens: ${updatedTotalInputTokens}`);
+   
+                }
+                const chatCompletionOptions: Together.Chat.Completions.ChatCompletionCreateParams = {
+                model: currentModelName,
+                max_tokens: max_tokens,
+                temperature: currentModelTemperature,               
+                messages: [
+                    { role: "system", content: currentModelType === "json" ? systemPromptJson : systemPromptText },
+                    { role: "user", content: updatedUserPrompt }
+                ],
+                stream: true,
+                ...(currentModelType === "json" && { response_format: {
+                                    type: "json_schema",
+                                    schema: {
+                                        type: "object",
+                                        properties: {
+                                            rephrasedParagraphs: {
+                                                type: "array",
+                                                title: "Rephrased paragraphs",
+                                                description: "A list of rephrased paragraphs",
+                                                items: {
+                                                    type: "object",
+                                                    properties: {
+                                                        rephrasedParagraphIndex: {
+                                                            type: "integer",
+                                                            description: "The sequential index of the rephrased paragraph (e.g., 1 for the first rephrased paragraph, 2 for the second, and so on)."
+                                                        },
+                                                        rephrasedParagraphContent: {
+                                                            type: "string",
+                                                            description: "The rephrased content of the paragraph. This content should be an elevated, enhanced, and melancholic version of the original text, while preserving its core meaning."
+                                                        },
+                                                        originalParagraphContents: {
+                                                            type: "array",
+                                                            description: "A list of strings, where each string is the exact content of an original paragraph that was used to form this rephrased paragraph. Only include paragraphs from the original text. If no clear mapping is found for this rephrased paragraph, this array should be empty.",
+                                                            items: {
+                                                                type: "string"
+                                                            }
+                                                        }
+                                                    },
+                                                    required: [
+                                                        "rephrasedParagraphIndex",
+                                                        "rephrasedParagraphContent",
+                                                        "originalParagraphContents"
+                                                    ],
+                                                    additionalProperties: false
+                                                }
+                                            }
+                                        },
+                                        required: [
+                                            "rephrasedParagraphs"
+                                        ],
+                                        additionalProperties: false
+                                    }
+                                } })
+            };
+            
+            console.log("Payload: Chat completion options:", chatCompletionOptions);
+
+            const responseStream = await together.chat.completions.create(chatCompletionOptions);
+            console.log("Response stream received from Together.ai, starting to process...");
+
+            if (currentModelType === "json") {
+
+                let buffer = '';
+
+                for await (const chunk of responseStream) {
+                    let content = '';
+
+                    if (chunk.usage ) {
+                        console.log('Usage data:', chunk.usage);
+                        totalOutputTokens = 0;
+                        if (chunk.usage.total_tokens !== undefined) {
+                            totalOutputTokens = chunk.usage.total_tokens || 0;
+                        } else {
+                             const promptTokens = chunk.usage.prompt_tokens || 0;
+                            const completionTokens = chunk.usage.completion_tokens || 0;
+                            totalOutputTokens = promptTokens + completionTokens;
+                        }
+                        updateUserCredits(userId, chunk.usage.promptTokens, chunk.usage.completionTokens, chunk.usage.total_tokens);
+                        continue;
+                        
+                        
+                    } 
+
+                    if (chunk.choices?.[0]?.finish_reason === 'length') {
+                        console.warn(`Model ${currentModelName} finished due to length limit.`, chunk.choices[0]);
+                        modelResposneStatus = 'Failed';
+                        modalFailureReason = 'TOKENS_LIMIT';
+                        continue;
+
+                    } else if (chunk.choices?.[0]?.finish_reason === 'stop') {
+                        console.log(`Model ${currentModelName} finished normally.`);
+                        modelResposneStatus = 'Success';    
+                        continue;
+                    }
+
+                    
+
+                    if (chunk.choices?.[0]?.delta?.content !== undefined) {
+                        content = chunk.choices[0].delta.content;
+                    } else if (chunk.choices?.[0]?.text !== undefined) {
+                        content = chunk.choices[0].text;
+                    }
+
+                    if (content) {
+                        buffer += content;
+                     //   console.log('buffer', buffer);
+
+                        
+
+
+                        // Try to extract and stream complete `rephrasedParagraph` objects
+                        
+                        //const regex = /{[^{}]*?"rephrasedParagraphIndex"[^{}]*?"rephrasedParagraphContent"[^{}]*?"originalParagraphContents"[^{}]*?\[[\s\S]*?\][^{}]*?}/g;
+                        const regex = /{\s*"rephrasedParagraphIndex"\s*:\s*\d+\s*,\s*"rephrasedParagraphContent"\s*:\s*"(?:[^"\\]|\\.)*?"\s*,\s*"originalParagraphContents"\s*:\s*\[[\s\S]*?\]\s*}/g;
+                        
+                        
+                        let match = buffer.match(regex);
+                         
+                        if (!match) continue;
+                            
+                            const matchedText = match[0];
+
+                            try {
+                                console.log("Matched paragraph:", matchedText);
+                                const obj = JSON.parse(matchedText);
+                                console.log('✅ Matched:', obj.rephrasedParagraphIndex);
+
+                                originalParagraphResponse.push(obj.originalParagraphContents);
+
+                                // Remove matched text from buffer
+                                
+                                //console.log('Buffer before slicing:', buffer);
+                                //console.log('Buffer before  slicing index:', buffer.indexOf(matchedText));
+                                //buffer = buffer.slice(buffer.indexOf(matchedText) + matchedText.length);
+                                buffer = '';
+                                //console.log('Buffer after slicing:', buffer);
+                                // stream to frontend
+                                 res.write(formatStreamPart(obj));
+                                res.flush();
+
+                            } catch (e) {
+                                console.warn('Error after regex parsing:', e);
+                                console.warn('Error after regex parsing: Invalid JSON:', matchedText);
+                            }
+                    }
+
+                  // totalOutputTokens += countTokens(content);
+
+                  
+
+                }
+
+                if (modelResposneStatus === 'Failed' && modalFailureReason === 'TOKENS_LIMIT') {
+                        console.warn(`Model ${currentModelName} failed due to token limit.`);
+                        if (attempt <= 3) {
+                            if (originalParagraphResponse?.length < textToRephrase.length) {
+                                const remainingParagraphs = textToRephrase.slice(originalParagraphResponse);
+                                const remainingParagraphsText = remainingParagraphs.join('\n');
+                                retryUserPrompt = `<originalText>${remainingParagraphsText || 'None'}</originalText>`;
+    
+                                attempt = attempt + 1;
+                            } else {
+                                console.error(`Model ${currentModelName} failed after repeating attempts due to token limit.`);     
+                                requireRetryWithFallbackModels = true;
+                            }        
+                            
+                        } else {
+                            console.error(`Model ${currentModelName} failed after 3 attempts due to token limit.`);
+                        }
+                    } else if (modelResposneStatus === 'Success') {
+                        console.log(`Model ${currentModelName} completed successfully.`);
+                        finalOutputSuccess = true; 
+                        res.write(formatStreamPart({ done: true }));
+                        res.flush();
+                        break; // Exit the loop for this model
+                    }
+
+
+            } else { // Handle text-only models
+                let accumulatedText = '';
+                for await (const chunk of responseStream) {
+                    if (chunk.choices && chunk.choices.length > 0 && chunk.choices[0].delta && chunk.choices[0].delta.content) {
+                        const content = chunk.choices[0].delta.content;
+                        accumulatedText += content;
+                        
+                    }
+                }
+                if (accumulatedText && accumulatedText.length > 0) {
+                    const textResponse = {
+                            rephrasedParagraphIndex:1,
+                            rephrasedParagraphContent: accumulatedText,
+                            originalParagraphContents: textToRephrase
+                        };
+                    res.write(`${JSON.stringify(textResponse)}\n`);
+
+                    res.flush();
+                    totalOutputTokens += countTokens(accumulatedText);
+                    finalOutputSuccess = true; 
+                } else {
+                    console.error(`Model ${currentModelName} was not able to rephrase properly.`);
+                    finalOutputSuccess = false;
+                }
+
+                
+                
+                // For text model, send a different completion signal or just the general 'done'
+                res.write(formatStreamPart({ done: true })); 
+                res.flush();
+            }
+            break; 
+                
+            }
+            if (modelResposneStatus === 'Success') {
+                console.log(`Model ${currentModelName} completed successfully. Skipping retryFallbackModels`);
+                break; // Exit the loop for this model
+            }
+            
+        } catch (error: any) {
+            console.error(`Error with model ${currentModelName}:`, error);
+            let errorMessage = `Error from model ${currentModelName}`;
+            if (error instanceof SyntaxError || (error.message && error.message.includes('JSON parse error'))) {
+                errorMessage = `Model ${currentModelName} returned malformed or incomplete JSON: ${error.message}`;
+            } else if (error.status && error.headers) { 
+                errorMessage = `API error from ${currentModelName} (Status: ${error.status}): ${error.message}`;
+            } else {
+                errorMessage = `Unexpected error from ${currentModelName}: ${error.message}`;
+            }
+
+
+        }
+    }
+
+    if (!finalOutputSuccess) {
+        res.write(formatStreamPart({ type: 'error', message: 'All models failed to generate a valid response.' }));
+        res.flush();
+    }
+
+  
+    res.end(); 
 });
 
 export default router;

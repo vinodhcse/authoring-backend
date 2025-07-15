@@ -129,6 +129,8 @@ router.post('/signup', async (req, res) => {
 router.post('/login', async (req, res) => {
   const { email, password } = req.body;
   try {
+    console.log("Login attempt with email:", email);
+    console.log("db", db)
     const snapshot = await db.collection('users').where('email', '==', email).limit(1).get();
     if (snapshot.empty) return res.status(401).json({ error: 'Invalid credentials' });
 
@@ -141,6 +143,7 @@ router.post('/login', async (req, res) => {
     const token = jwt.sign({ userId: userDoc.id, email, globalRole: user.globalRole }, JWT_SECRET, { expiresIn: TOKEN_EXPIRY });
     res.json({ token, userId: userDoc.id, globalRole: user.globalRole, name: user.name, email: user.email });
   } catch (err) {
+    console.error("Login error:", err);
     res.status(500).json({ error: 'Login failed' });
   }
 });
