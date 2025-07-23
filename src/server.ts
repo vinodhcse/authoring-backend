@@ -15,7 +15,8 @@ import authRouter from './routes/auth';
 import { authenticateJWT } from './middleware/authenticateJWT';
 import filesRouter from './routes/files';
 import jobsRouter from './routes/job';
-import aifeatures from './routes/aifeatures';
+import aifeatures from './routes/ai/aifeatures';
+
 
 
 dotenv.config();
